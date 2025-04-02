@@ -1,162 +1,185 @@
----
-id: getting-started
-title: Getting Started
----
+import React, { useState, useEffect, useRef } from 'react';
+import firebase from 'firebase/app';
+import 'firebase/firestore';
 
-Create React App is an officially supported way to create single-page React
-applications. It offers a modern build setup with no configuration.
+// Initialize Firebase – replace with your own config!
+if (!firebase.apps.length) {
+  firebase.initializeApp({
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_AUTH_DOMAIN",
+    projectId: "YOUR_PROJECT_ID",
+    // ...other config values
+  });
+}
+const firestore = firebase.firestore();
 
-## Quick Start
+const configuration = {
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+};
 
-```sh
-npx create-react-app my-app
-cd my-app
-npm start
-```
+const App = () => {
+  const [stream, setStream] = useState(null);
+  const [isLawyer, setIsLawyer] = useState(false);
+  const [incomingCall, setIncomingCall] = useState(false);
+  const [isAvailable, setIsAvailable] = useState(false);
+  const localVideoRef = useRef(null);
+  const pc = useRef(new RTCPeerConnection(configuration));
 
-> If you've previously installed `create-react-app` globally via `npm install -g create-react-app`, we recommend you uninstall the package using `npm uninstall -g create-react-app` or `yarn global remove create-react-app` to ensure that `npx` always uses the latest version.
+  // Firestore documents for signaling
+  const callDoc = firestore.collection('calls').doc('activeCall');
+  const lawyerStatusDoc = firestore.collection('lawyers').doc('status');
 
-_([npx](https://medium.com/@maybekatz/introducing-npx-an-npm-package-runner-55f7d4bd282b) comes with npm 5.2+ and higher, see [instructions for older npm versions](https://gist.github.com/gaearon/4064d3c23a77c74a3614c498a8bb1c5f))_
+  useEffect(() => {
+    requestNotificationPermission();
+    // Listen for call document updates as a substitute for push notifications
+    const unsubscribe = callDoc.onSnapshot((doc) => {
+      if (doc.exists) {
+        const data = doc.data();
+        // If there is an incoming call flag set and the lawyer is available, show UI notification.
+        if (data.incomingCall && isAvailable) {
+          setIncomingCall(true);
+          showBrowserNotification('Incoming Call', 'A client is calling you.');
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, [isAvailable]);
 
-Then open [http://localhost:3000/](http://localhost:3000/) to see your app.
+  const requestNotificationPermission = async () => {
+    if ('Notification' in window) {
+      const permission = await Notification.requestPermission();
+      if (permission === 'granted') {
+        console.log('Browser notification permission granted');
+      }
+    }
+  };
 
-When you’re ready to deploy to production, create a minified bundle with `npm run build`.
+  const showBrowserNotification = (title, body) => {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(title, { body });
+    }
+  };
 
-<p align='center'>
-<img src='https://cdn.jsdelivr.net/gh/facebook/create-react-app@27b42ac7efa018f2541153ab30d63180f5fa39e0/screencast.svg' width='600' alt='npm start' />
-</p>
+  const toggleAvailability = async () => {
+    const newAvailability = !isAvailable;
+    setIsAvailable(newAvailability);
+    await lawyerStatusDoc.set({ available: newAvailability });
+  };
 
-### Get Started Immediately
+  const startVideoCall = async () => {
+    try {
+      // Check for available lawyers
+      const availableLawyers = await firestore
+        .collection('lawyers')
+        .where('available', '==', true)
+        .get();
+      if (availableLawyers.empty) {
+        alert('No available lawyers at the moment. Please try again later.');
+        return;
+      }
+      // Get local media stream
+      const localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      setStream(localStream);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = localStream;
+      }
+      localStream.getTracks().forEach((track) =>
+        pc.current.addTrack(track, localStream)
+      );
+      // Create offer
+      const offer = await pc.current.createOffer();
+      await pc.current.setLocalDescription(offer);
+      // Save offer and flag incoming call in Firestore
+      await callDoc.set({ offer, incomingCall: true });
+    } catch (error) {
+      console.error('Error starting video call:', error);
+    }
+  };
 
-You **don’t** need to install or configure tools like webpack or Babel. They are preconfigured and hidden so that you can focus on the code.
+  const answerCall = async () => {
+    try {
+      setIsLawyer(true);
+      setIncomingCall(false);
+      // Get local media stream
+      const localStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      setStream(localStream);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = localStream;
+      }
+      localStream.getTracks().forEach((track) =>
+        pc.current.addTrack(track, localStream)
+      );
+      const callData = await callDoc.get();
+      if (!callData.exists) return;
+      // Set remote description from the offer
+      await pc.current.setRemoteDescription(
+        new RTCSessionDescription(callData.data().offer)
+      );
+      // Create and send answer
+      const answer = await pc.current.createAnswer();
+      await pc.current.setLocalDescription(answer);
+      await callDoc.update({ answer, incomingCall: false });
+    } catch (error) {
+      console.error('Error answering call:', error);
+    }
+  };
 
-Create a project, and you’re good to go.
+  const declineCall = () => {
+    setIncomingCall(false);
+    callDoc.update({ incomingCall: false });
+  };
 
-## Creating an App
+  return (
+    <div style={{ textAlign: 'center', padding: '20px' }}>
+      <h1>Lawyer On Demand</h1>
+      {isLawyer ? (
+        <div>
+          <button onClick={toggleAvailability}>
+            {isAvailable ? 'Go Offline' : 'Go Online'}
+          </button>
+          {incomingCall ? (
+            <div
+              style={{
+                border: '1px solid #ccc',
+                padding: '20px',
+                margin: '20px auto',
+                width: '300px',
+              }}
+            >
+              <p>Incoming Call</p>
+              <button onClick={answerCall} style={{ marginRight: '10px' }}>
+                Accept
+              </button>
+              <button onClick={declineCall}>Decline</button>
+            </div>
+          ) : (
+            <p>No Incoming Calls</p>
+          )}
+        </div>
+      ) : (
+        <button onClick={startVideoCall}>Call Lawyer</button>
+      )}
+      {stream && (
+        <video
+          ref={localVideoRef}
+          autoPlay
+          playsInline
+          style={{
+            width: '300px',
+            height: '400px',
+            backgroundColor: 'black',
+            marginTop: '20px',
+          }}
+        ></video>
+      )}
+    </div>
+  );
+};
 
-**You’ll need to have Node >= 14 on your local development machine** (but it’s not required on the server). You can use [nvm](https://github.com/creationix/nvm#installation) (macOS/Linux) or [nvm-windows](https://github.com/coreybutler/nvm-windows#node-version-manager-nvm-for-windows) to switch Node versions between different projects.
-
-To create a new app, you may choose one of the following methods:
-
-### npx
-
-```sh
-npx create-react-app@latest my-app
-```
-
-_([npx](https://medium.com/@maybekatz/introducing-npx-an-npm-package-runner-55f7d4bd282b) comes with npm 5.2+ and higher, see [instructions for older npm versions](https://gist.github.com/gaearon/4064d3c23a77c74a3614c498a8bb1c5f))_
-
-### npm
-
-```sh
-npm init react-app my-app
-```
-
-_`npm init <initializer>` is available in npm 6+_
-
-### Yarn
-
-```sh
-yarn create react-app my-app
-```
-
-_`yarn create` is available in Yarn 0.25+_
-
-### Selecting a template
-
-You can now optionally start a new app from a template by appending `--template [template-name]` to the creation command.
-
-If you don't select a template, we'll create your project with our base template.
-
-Templates are always named in the format `cra-template-[template-name]`, however you only need to provide the `[template-name]` to the creation command.
-
-```sh
-npx create-react-app my-app --template [template-name]
-```
-
-> You can find a list of available templates by searching for ["cra-template-\*"](https://www.npmjs.com/search?q=cra-template-*) on npm.
-
-Our [Custom Templates](custom-templates.md) documentation describes how you can build your own template.
-
-#### Creating a TypeScript app
-
-You can start a new TypeScript app using templates. To use our provided TypeScript template, append `--template typescript` to the creation command.
-
-```sh
-npx create-react-app my-app --template typescript
-```
-
-If you already have a project and would like to add TypeScript, see our [Adding TypeScript](adding-typescript.md) documentation.
-
-### Selecting a package manager
-
-When you create a new app, the CLI will use [npm](https://docs.npmjs.com) or [Yarn](https://yarnpkg.com/) to install dependencies, depending on which tool you use to run `create-react-app`. For example:
-
-```sh
-# Run this to use npm
-npx create-react-app my-app
-# Or run this to use yarn
-yarn create react-app my-app
-```
-
-## Output
-
-Running any of these commands will create a directory called `my-app` inside the current folder. Inside that directory, it will generate the initial project structure and install the transitive dependencies:
-
-```
-my-app
-├── README.md
-├── node_modules
-├── package.json
-├── .gitignore
-├── public
-│   ├── favicon.ico
-│   ├── index.html
-│   ├── logo192.png
-│   ├── logo512.png
-│   ├── manifest.json
-│   └── robots.txt
-└── src
-    ├── App.css
-    ├── App.js
-    ├── App.test.js
-    ├── index.css
-    ├── index.js
-    ├── logo.svg
-    ├── serviceWorker.js
-    └── setupTests.js
-```
-
-No configuration or complicated folder structures, only the files you need to build your app. Once the installation is done, you can open your project folder:
-
-```sh
-cd my-app
-```
-
-## Scripts
-
-Inside the newly created project, you can run some built-in commands:
-
-### `npm start` or `yarn start`
-
-Runs the app in development mode. Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
-
-The page will automatically reload if you make changes to the code. You will see the build errors and lint warnings in the console.
-
-<p align='center'>
-<img src='https://cdn.jsdelivr.net/gh/marionebl/create-react-app@9f6282671c54f0874afd37a72f6689727b562498/screencast-error.svg' width='600' alt='Build errors' />
-</p>
-
-### `npm test` or `yarn test`
-
-Runs the test watcher in an interactive mode. By default, runs tests related to files changed since the last commit.
-
-[Read more about testing](running-tests.md).
-
-### `npm run build` or `yarn build`
-
-Builds the app for production to the `build` folder. It correctly bundles React in production mode and optimizes the build for the best performance.
-
-The build is minified and the filenames include the hashes.
-
-Your app is ready to be deployed.
+export default App;
